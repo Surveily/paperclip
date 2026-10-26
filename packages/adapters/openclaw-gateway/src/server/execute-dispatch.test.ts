@@ -9,6 +9,8 @@ const websocketState = vi.hoisted(() => ({
   events: [] as string[],
   messages: [] as string[],
   acceptOnly: false,
+  holdAgent: false,
+  pendingAgentId: null as string | null,
   pendingWaitId: null as string | null,
   abortParams: [] as Record<string, unknown>[],
 }));
@@ -55,6 +57,12 @@ vi.mock("ws", async () => {
           this.emit("message", JSON.stringify({ type: "res", id, ok: true, payload: responsePayload }));
         });
       };
+      // holdAgent: the gateway starts the run but does not answer the agent
+      // request yet (a slow reply); sessions.abort ends it.
+      if (websocketState.holdAgent && request.method === "agent") {
+        websocketState.pendingAgentId = request.id;
+        return;
+      }
       // acceptOnly: the gateway accepts the run and holds agent.wait until
       // sessions.abort ends it, like a long-running OpenClaw turn.
       if (websocketState.acceptOnly && request.method === "agent") {
@@ -71,6 +79,10 @@ vi.mock("ws", async () => {
         if (websocketState.pendingWaitId) {
           respond(websocketState.pendingWaitId, { status: "error", error: "aborted" });
           websocketState.pendingWaitId = null;
+        }
+        if (websocketState.pendingAgentId) {
+          respond(websocketState.pendingAgentId, { status: "error", summary: "aborted" });
+          websocketState.pendingAgentId = null;
         }
         return;
       }
@@ -129,6 +141,8 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     websocketState.events = [];
     websocketState.messages = [];
     websocketState.acceptOnly = false;
+    websocketState.holdAgent = false;
+    websocketState.pendingAgentId = null;
     websocketState.pendingWaitId = null;
     websocketState.abortParams = [];
   });
@@ -148,6 +162,25 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     expect(ctx.onCancellationReady).toHaveBeenCalledTimes(1);
     expect(websocketState.abortParams).toEqual([
       expect.objectContaining({ key: expect.any(String), runId: "remote-run-1", clearQueued: true }),
+    ]);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("aborts the gateway session when the cancel arrives before the agent reply", async () => {
+    websocketState.holdAgent = true;
+    const controller = new AbortController();
+    const ctx = createContext();
+    ctx.signal = controller.signal;
+    ctx.onCancellationReady = vi.fn(async () => {});
+
+    const run = execute(ctx);
+    await vi.waitFor(() => expect(websocketState.events).toContain("send:agent"));
+    controller.abort(new Error("Cancelled by a board operator"));
+    const result = await run;
+
+    // The gateway has not named its run yet, so the adapter uses the run id it sent.
+    expect(websocketState.abortParams).toEqual([
+      expect.objectContaining({ key: expect.any(String), runId: "run-1", clearQueued: true }),
     ]);
     expect(result.exitCode).toBe(1);
   });
