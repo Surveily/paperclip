@@ -1340,37 +1340,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
 
-      // Keep any server-side continuation lock through retryable websocket
-      // setup and backoff. The first agent request is the remote-work boundary:
-      // once it is sent, retrying would be unsafe because the gateway may have
-      // accepted work even if the response is lost.
-      reportDispatch();
-      const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
-        timeoutMs: connectTimeoutMs,
-      });
-
-      latestResultPayload = acceptedPayload;
-
-      const acceptedStatus = nonEmpty(acceptedPayload?.status)?.toLowerCase() ?? "";
-      const acceptedRunId = nonEmpty(acceptedPayload?.runId) ?? ctx.runId;
-      trackedRunIds.add(acceptedRunId);
-
-      await ctx.onLog(
-        "stdout",
-        `[openclaw-gateway] agent accepted runId=${acceptedRunId} status=${acceptedStatus || "unknown"}\n`,
-      );
-
       // A cancelled Paperclip run must stop the gateway session too. Without
       // this the session keeps running, and OpenClaw's restart recovery even
-      // resumes it after a gateway restart. agent.wait then returns, and the
-      // run settles below.
+      // resumes it after a gateway restart. Install it before the agent
+      // request: a cancel can arrive while that request is still pending.
+      // Until the gateway answers, its run id is our own (idempotencyKey).
+      let gatewayRunId = ctx.runId;
       const abortGatewaySession = () => {
         void client
           .request(
             "sessions.abort",
             {
               key: sessionKey,
-              runId: acceptedRunId,
+              runId: gatewayRunId,
               ...(nonEmpty(agentParams.agentId) ? { agentId: nonEmpty(agentParams.agentId) } : {}),
               clearQueued: true,
             },
@@ -1384,9 +1366,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ),
           );
       };
-      if (ctx.signal?.aborted) abortGatewaySession();
-      else ctx.signal?.addEventListener("abort", abortGatewaySession, { once: true });
+      ctx.signal?.addEventListener("abort", abortGatewaySession, { once: true });
       removeAbortListener = () => ctx.signal?.removeEventListener("abort", abortGatewaySession);
+
+      // Keep any server-side continuation lock through retryable websocket
+      // setup and backoff. The first agent request is the remote-work boundary:
+      // once it is sent, retrying would be unsafe because the gateway may have
+      // accepted work even if the response is lost.
+      reportDispatch();
+      const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
+        timeoutMs: connectTimeoutMs,
+      });
+
+      latestResultPayload = acceptedPayload;
+
+      const acceptedStatus = nonEmpty(acceptedPayload?.status)?.toLowerCase() ?? "";
+      const acceptedRunId = nonEmpty(acceptedPayload?.runId) ?? ctx.runId;
+      gatewayRunId = acceptedRunId;
+      trackedRunIds.add(acceptedRunId);
+
+      await ctx.onLog(
+        "stdout",
+        `[openclaw-gateway] agent accepted runId=${acceptedRunId} status=${acceptedStatus || "unknown"}\n`,
+      );
 
       if (acceptedStatus === "error") {
         const errorMessage =
