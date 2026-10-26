@@ -1259,6 +1259,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onEvent,
       onLog: ctx.onLog,
     });
+    let removeAbortListener: (() => void) | null = null;
 
     try {
       deviceIdentity = disableDeviceAuth ? null : resolveDeviceIdentity(parseObject(ctx.config));
@@ -1326,6 +1327,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)}\n`,
       );
 
+      // Opt in to operator cancellation before the gateway gets any work, and
+      // do not start work for a run that was stopped meanwhile.
+      await ctx.onCancellationReady?.();
+      if (ctx.signal?.aborted) {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Run was cancelled before it reached the OpenClaw gateway",
+          errorCode: "openclaw_gateway_cancelled",
+        };
+      }
+
       // Keep any server-side continuation lock through retryable websocket
       // setup and backoff. The first agent request is the remote-work boundary:
       // once it is sent, retrying would be unsafe because the gateway may have
@@ -1345,6 +1359,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[openclaw-gateway] agent accepted runId=${acceptedRunId} status=${acceptedStatus || "unknown"}\n`,
       );
+
+      // A cancelled Paperclip run must stop the gateway session too. Without
+      // this the session keeps running, and OpenClaw's restart recovery even
+      // resumes it after a gateway restart. agent.wait then returns, and the
+      // run settles below.
+      const abortGatewaySession = () => {
+        void client
+          .request(
+            "sessions.abort",
+            {
+              key: sessionKey,
+              runId: acceptedRunId,
+              ...(nonEmpty(agentParams.agentId) ? { agentId: nonEmpty(agentParams.agentId) } : {}),
+              clearQueued: true,
+            },
+            { timeoutMs: connectTimeoutMs },
+          )
+          .then(() => ctx.onLog("stdout", `[openclaw-gateway] run cancelled: sessions.abort sent for ${sessionKey}\n`))
+          .catch((err: unknown) =>
+            ctx.onLog(
+              "stderr",
+              `[openclaw-gateway] sessions.abort failed: ${err instanceof Error ? err.message : String(err)}\n`,
+            ),
+          );
+      };
+      if (ctx.signal?.aborted) abortGatewaySession();
+      else ctx.signal?.addEventListener("abort", abortGatewaySession, { once: true });
+      removeAbortListener = () => ctx.signal?.removeEventListener("abort", abortGatewaySession);
 
       if (acceptedStatus === "error") {
         const errorMessage =
@@ -1530,6 +1572,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: asRecord(latestResultPayload),
       };
     } finally {
+      removeAbortListener?.();
       client.close();
     }
   }
