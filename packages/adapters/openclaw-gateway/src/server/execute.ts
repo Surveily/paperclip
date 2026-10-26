@@ -1045,7 +1045,36 @@ function extractResultText(value: unknown): string | null {
   return nonEmpty(record.text) ?? nonEmpty(record.summary) ?? null;
 }
 
+/** Whether the gateway confirmed a stop requested by Paperclip's cancel. */
+interface GatewayCancellation {
+  abortConfirmed: Promise<boolean> | null;
+}
+
+function acknowledgedCancellation(): Record<string, unknown> {
+  return { state: "acknowledged", acknowledgedAt: new Date().toISOString(), forced: false };
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const cancellation: GatewayCancellation = { abortConfirmed: null };
+  const result = await executeGatewayRun(ctx, cancellation);
+  // heartbeat.cancelRun accepts a stop only when the result acknowledges it.
+  // Acknowledge only what the gateway confirmed: sessions.abort succeeded and
+  // the run's request returned. Otherwise the run stays "not verified".
+  if (!ctx.signal?.aborted || !cancellation.abortConfirmed) return result;
+  if (!(await cancellation.abortConfirmed)) return result;
+  await ctx.onProviderStopped?.();
+  return {
+    ...result,
+    errorCode: "cancelled",
+    errorMessage: "Cancelled; the OpenClaw gateway stopped the session",
+    resultJson: { ...(result.resultJson ?? {}), executionCancellation: acknowledgedCancellation() },
+  };
+}
+
+async function executeGatewayRun(
+  ctx: AdapterExecutionContext,
+  cancellation: GatewayCancellation,
+): Promise<AdapterExecutionResult> {
   const urlValue = asString(ctx.config.url, "").trim();
   if (!urlValue) {
     return {
@@ -1332,11 +1361,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await ctx.onCancellationReady?.();
       if (ctx.signal?.aborted) {
         return {
-          exitCode: 1,
+          exitCode: null,
           signal: null,
           timedOut: false,
-          errorMessage: "Run was cancelled before it reached the OpenClaw gateway",
-          errorCode: "openclaw_gateway_cancelled",
+          errorMessage: "Stopped before the OpenClaw gateway got the run",
+          errorCode: "cancelled",
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          resultJson: { executionCancellation: acknowledgedCancellation() },
         };
       }
 
@@ -1347,7 +1378,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Until the gateway answers, its run id is our own (idempotencyKey).
       let gatewayRunId = ctx.runId;
       const abortGatewaySession = () => {
-        void client
+        cancellation.abortConfirmed = client
           .request(
             "sessions.abort",
             {
@@ -1358,13 +1389,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             },
             { timeoutMs: connectTimeoutMs },
           )
-          .then(() => ctx.onLog("stdout", `[openclaw-gateway] run cancelled: sessions.abort sent for ${sessionKey}\n`))
-          .catch((err: unknown) =>
-            ctx.onLog(
+          .then(async () => {
+            await ctx.onLog("stdout", `[openclaw-gateway] run cancelled: sessions.abort sent for ${sessionKey}\n`);
+            return true;
+          })
+          .catch(async (err: unknown) => {
+            await ctx.onLog(
               "stderr",
               `[openclaw-gateway] sessions.abort failed: ${err instanceof Error ? err.message : String(err)}\n`,
-            ),
-          );
+            );
+            return false;
+          });
       };
       ctx.signal?.addEventListener("abort", abortGatewaySession, { once: true });
       removeAbortListener = () => ctx.signal?.removeEventListener("abort", abortGatewaySession);
@@ -1575,6 +1610,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     } finally {
       removeAbortListener?.();
+      // Let a pending sessions.abort answer before the connection closes; the
+      // promise never rejects and the request has its own timeout.
+      if (cancellation.abortConfirmed) await cancellation.abortConfirmed;
       client.close();
     }
   }

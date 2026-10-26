@@ -10,6 +10,7 @@ const websocketState = vi.hoisted(() => ({
   messages: [] as string[],
   acceptOnly: false,
   holdAgent: false,
+  abortFails: false,
   pendingAgentId: null as string | null,
   pendingWaitId: null as string | null,
   abortParams: [] as Record<string, unknown>[],
@@ -75,7 +76,15 @@ vi.mock("ws", async () => {
       }
       if (request.method === "sessions.abort") {
         websocketState.abortParams.push(request.params ?? {});
-        respond(request.id, { ok: true, aborted: true });
+        if (websocketState.abortFails) {
+          queueMicrotask(() => {
+            this.emit("message", JSON.stringify({
+              type: "res", id: request.id, ok: false, error: { code: "UNAVAILABLE", message: "abort failed" },
+            }));
+          });
+        } else {
+          respond(request.id, { ok: true, aborted: true });
+        }
         if (websocketState.pendingWaitId) {
           respond(websocketState.pendingWaitId, { status: "error", error: "aborted" });
           websocketState.pendingWaitId = null;
@@ -142,6 +151,7 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     websocketState.messages = [];
     websocketState.acceptOnly = false;
     websocketState.holdAgent = false;
+    websocketState.abortFails = false;
     websocketState.pendingAgentId = null;
     websocketState.pendingWaitId = null;
     websocketState.abortParams = [];
@@ -153,6 +163,7 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     const ctx = createContext();
     ctx.signal = controller.signal;
     ctx.onCancellationReady = vi.fn(async () => {});
+    ctx.onProviderStopped = vi.fn(async () => {});
 
     const run = execute(ctx);
     await vi.waitFor(() => expect(websocketState.events).toContain("send:agent.wait"));
@@ -163,7 +174,28 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     expect(websocketState.abortParams).toEqual([
       expect.objectContaining({ key: expect.any(String), runId: "remote-run-1", clearQueued: true }),
     ]);
-    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("cancelled");
+    expect(result.resultJson?.executionCancellation).toMatchObject({ state: "acknowledged", forced: false });
+    expect(ctx.onProviderStopped).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not acknowledge the cancel when the gateway refuses sessions.abort", async () => {
+    websocketState.acceptOnly = true;
+    websocketState.abortFails = true;
+    const controller = new AbortController();
+    const ctx = createContext();
+    ctx.signal = controller.signal;
+    ctx.onCancellationReady = vi.fn(async () => {});
+    ctx.onProviderStopped = vi.fn(async () => {});
+
+    const run = execute(ctx);
+    await vi.waitFor(() => expect(websocketState.events).toContain("send:agent.wait"));
+    controller.abort(new Error("Cancelled by a board operator"));
+    const result = await run;
+
+    expect(websocketState.abortParams).toHaveLength(1);
+    expect(result.resultJson?.executionCancellation).toBeUndefined();
+    expect(ctx.onProviderStopped).not.toHaveBeenCalled();
   });
 
   it("aborts the gateway session when the cancel arrives before the agent reply", async () => {
@@ -182,7 +214,7 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     expect(websocketState.abortParams).toEqual([
       expect.objectContaining({ key: expect.any(String), runId: "run-1", clearQueued: true }),
     ]);
-    expect(result.exitCode).toBe(1);
+    expect(result.resultJson?.executionCancellation).toMatchObject({ state: "acknowledged" });
   });
 
   it("does not send the run to the gateway when it was cancelled before dispatch", async () => {
@@ -194,7 +226,12 @@ describe("openclaw_gateway execute dispatch boundary", () => {
 
     const result = await execute(ctx);
 
-    expect(result).toMatchObject({ exitCode: 1, errorCode: "openclaw_gateway_cancelled" });
+    expect(result).toMatchObject({
+      exitCode: null,
+      errorCode: "cancelled",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      resultJson: { executionCancellation: { state: "acknowledged" } },
+    });
     expect(websocketState.events).not.toContain("send:agent");
   });
 
